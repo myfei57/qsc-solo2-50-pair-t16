@@ -35,20 +35,69 @@ pre { font-size: 12px; background: #0f0d0a; padding: 10px; border-radius: 6px; o
 """
 
 _SCRIPT = """
+function isUnavailable(value) {
+  return value && typeof value === 'object' && value.unavailable === true;
+}
+
+function present(value) {
+  // 把后端标记为不可用的数据块渲染成明确提示，其余数据照常展示。
+  if (isUnavailable(value)) {
+    return value.status || '暂时不可用';
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => present(item));
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = present(item);
+    }
+    return out;
+  }
+  return value;
+}
+
+async function fetchBlock(path, elementId, fallbackLabel, render) {
+  const target = document.getElementById(elementId);
+  try {
+    const response = await fetch(path);
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status);
+    }
+    const payload = await response.json();
+    if (isUnavailable(payload)) {
+      target.textContent = (payload.status || fallbackLabel + '暂时不可用')
+        + '\\n' + (payload.reason || '');
+      return;
+    }
+    target.textContent = render(payload);
+  } catch (error) {
+    target.textContent = fallbackLabel + '暂时不可用（' + error.message + '）';
+  }
+}
+
 async function refresh() {
-  const status = await (await fetch('/api/status')).json();
-  const alarms = await (await fetch('/api/alarms')).json();
-  const trend = await (await fetch('/api/trend?window_s=600')).json();
-  document.getElementById('out-status').textContent = JSON.stringify(status, null, 2);
-  document.getElementById('out-alarms').textContent =
-    alarms.count + ' 条告警\\n' + JSON.stringify(alarms.alarms.slice(-8), null, 2);
-  document.getElementById('out-trend').textContent = JSON.stringify(trend.series, null, 2);
+  // 三块数据各自独立请求：一块后台读不到，只标它自己，不拖垮整页。
+  await Promise.all([
+    fetchBlock('/api/status', 'out-status', '实时状态',
+      (payload) => JSON.stringify(present(payload), null, 2)),
+    fetchBlock('/api/alarms', 'out-alarms', '告警',
+      (alarms) => isUnavailable(alarms.alarms)
+        ? (alarms.alarms.status + '\\n' + alarms.alarms.reason)
+        : alarms.count + ' 条告警\\n' + JSON.stringify(alarms.alarms.slice(-8), null, 2)),
+    fetchBlock('/api/trend?window_s=600', 'out-trend', '趋势窗口',
+      (payload) => JSON.stringify(present(payload.series), null, 2)),
+  ]);
 }
 async function act(path, payload) {
   const init = {method: 'POST', headers: {'Content-Type': 'application/json'}};
   if (payload) { init.body = JSON.stringify(payload); }
-  const result = await (await fetch(path, init)).json();
-  document.getElementById('out-action').textContent = JSON.stringify(result, null, 2);
+  try {
+    const result = await (await fetch(path, init)).json();
+    document.getElementById('out-action').textContent = JSON.stringify(result, null, 2);
+  } catch (error) {
+    document.getElementById('out-action').textContent = '操作暂时不可用（' + error.message + '）';
+  }
   refresh();
 }
 window.addEventListener('DOMContentLoaded', () => {

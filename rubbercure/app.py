@@ -95,6 +95,12 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
 
+    @property
+    def cycles(self) -> int:
+        """已推进的机群控制周期数。"""
+
+        return self._cycles
+
     def _seed_reference_curve(self) -> None:
         """登记一份出厂参考曲线，供默认制品型号直接投产。"""
 
@@ -450,7 +456,7 @@ class Platform:
             "platform": self.config.name,
             "project_id": self.config.project_id,
             "unit": self.namespaces.unit,
-            "cycles": self._cycles,
+            "cycles": self.cycles,
             "now": round(self.clock.now(), 3),
             "utc": self.clock.utc_iso(),
             "molds": summarize_molds(self.registry),

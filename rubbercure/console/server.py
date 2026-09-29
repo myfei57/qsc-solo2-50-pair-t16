@@ -92,6 +92,10 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not-found", "path": parsed.path}, status=404)
         except (ValueError, KeyError) as error:
             self._send_json({"error": str(error)}, status=400)
+        except Exception as error:  # 只读视图兜底：服务本身不能被一块坏数据带崩
+            self._send_json(
+                {"error": "internal-error", "message": str(error)}, status=502
+            )
 
     def do_POST(self) -> None:  # noqa: N802 - http.server 回调命名
         parsed = urlparse(self.path)
@@ -116,6 +120,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not-found", "path": parsed.path}, status=404)
         except (ValueError, KeyError) as error:
             self._send_json({"error": str(error)}, status=400)
+        except Exception as error:  # 动作执行兜底：把失败收敛成结构化响应
+            self._send_json(
+                {"ok": False, "error": {"type": "internal-error", "message": str(error)}},
+                status=502,
+            )
 
 
 class ConsoleServer:

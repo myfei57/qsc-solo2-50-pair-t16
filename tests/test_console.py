@@ -6,9 +6,11 @@ import json
 import urllib.error
 import urllib.request
 
-from rubbercure.console.api import ConsoleAPI
+from rubbercure.app import CycleInputs
+from rubbercure.console.api import ConsoleAPI, UNAVAILABLE_STATUS
 from rubbercure.console.pages import PAGE_TITLES, render_page
 from rubbercure.console.server import ConsoleServer, probe_pages
+from rubbercure.telemetry import TrendBuffer
 
 
 def _request(url: str, method: str = "GET", payload: dict | None = None):
@@ -109,3 +111,113 @@ def test_render_page_rejects_unknown_page(platform):
         assert "nope" in str(error)
     else:  # pragma: no cover - 未抛错即失败
         raise AssertionError("未知页面必须报错")
+
+
+def test_status_isolates_a_failing_block(platform):
+    api = ConsoleAPI(platform)
+
+    def broken_summary():
+        raise RuntimeError("落盘审计目录不可读")
+
+    platform.audit.summary = broken_summary  # type: ignore[method-assign]
+
+    payload = api.status()
+    assert payload["audit"]["unavailable"] is True
+    assert payload["audit"]["status"] == UNAVAILABLE_STATUS
+    assert "落盘审计目录不可读" in payload["audit"]["reason"]
+    # 其余数据块照常返回
+    assert payload["platform"] == "RubberCure"
+    assert payload["fleet"]["size"] == platform.fleet.size
+    assert "missing" in payload["topology"]
+
+
+def test_status_endpoint_stays_200_when_one_backend_block_fails(platform):
+    server = ConsoleServer(platform)
+    base_url = server.start()
+    try:
+        platform.fleet.snapshot = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("机群快照盘损坏")
+        )
+        status, payload = _request(f"{base_url}/api/status")
+        assert status == 200
+        assert payload["presses"]["status"] == UNAVAILABLE_STATUS
+        assert "机群快照盘损坏" in payload["presses"]["reason"]
+        assert payload["platform"] == "RubberCure"
+        assert payload["scheduler"]["phase"] is not None
+    finally:
+        server.stop()
+
+
+def test_trend_isolates_each_series(platform):
+    api = ConsoleAPI(platform)
+    platform.cycle(CycleInputs(inlet_c=26.0, steam_target_kpa=600.0, dt=1.0))
+    assert set(api.trend()["series"]) == {"fleet_load", "mold_temp", "steam_pressure"}
+
+    original_window = TrendBuffer.window
+
+    def broken_window(self, name, start, end):
+        if name == "steam_pressure":
+            raise RuntimeError("蒸汽压力缓冲损坏")
+        return original_window(self, name, start, end)
+
+    TrendBuffer.window = broken_window  # type: ignore[method-assign]
+    try:
+        payload = api.trend()
+        assert payload["series"]["steam_pressure"]["status"] == UNAVAILABLE_STATUS
+        assert payload["series"]["mold_temp"]["latest"] is not None
+        assert payload["series"]["fleet_load"]["latest"] is not None
+    finally:
+        TrendBuffer.window = original_window  # type: ignore[method-assign]
+
+
+def test_alarms_returns_marker_instead_of_failing(platform):
+    api = ConsoleAPI(platform)
+
+    def broken_alarms():
+        raise OSError("告警索引读不回来")
+
+    platform.audit.alarms = broken_alarms  # type: ignore[method-assign]
+
+    payload = api.alarms()
+    assert payload["alarms"]["unavailable"] is True
+    assert payload["alarms"]["status"] == UNAVAILABLE_STATUS
+    assert "告警索引读不回来" in payload["alarms"]["reason"]
+
+
+def test_unexpected_endpoint_error_is_structured_not_crash(platform):
+    server = ConsoleServer(platform)
+    base_url = server.start()
+    try:
+        platform.audit.alarms = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("突发故障")
+        )
+        status, payload = _request(f"{base_url}/api/alarms")
+        assert status == 200
+        assert payload["alarms"]["status"] == UNAVAILABLE_STATUS
+    finally:
+        server.stop()
+
+
+def test_rendered_page_handles_each_block_independently(platform):
+    html = render_page("press", platform)
+    assert "暂时不可用" in html
+    assert "fetchBlock('/api/status'" in html
+    assert "fetchBlock('/api/alarms'" in html
+    assert "fetchBlock('/api/trend" in html
+
+
+def test_readiness_isolates_each_precondition(platform):
+    api = ConsoleAPI(platform)
+
+    def broken_entries():
+        raise RuntimeError("队列段文件丢失")
+
+    platform.scheduler.queue.entries = broken_entries  # type: ignore[method-assign]
+
+    payload = api.readiness()
+    assert payload["queued"]["status"] == UNAVAILABLE_STATUS
+    assert "队列段文件丢失" in payload["queued"]["reason"]
+    # 其余体检项照常返回
+    assert len(payload["idle_presses"]) == platform.fleet.size
+    assert payload["molds"]["total"] == 0
+    assert payload["steam_target_kpa"] == platform.config.steam.target_pressure_kpa

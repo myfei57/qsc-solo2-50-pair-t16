@@ -7,11 +7,32 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ..app import CycleInputs, Platform
 from ..errors import RubberCureError
+from ..mold.summary import summarize_molds
+from ..press.summary import summarize_fleet
 
 MAX_TREND_WINDOW_S = 86_400.0
 MAX_AUDIT_LIMIT = 500
+
+UNAVAILABLE_STATUS = "暂时不可用"
+
+
+def unavailable(reason: object) -> dict:
+    """标记一块读不到的后台数据，其余数据块不受影响。"""
+
+    return {"unavailable": True, "status": UNAVAILABLE_STATUS, "reason": str(reason)}
+
+
+def safe_block(label: str, producer: Callable[[], object]) -> object:
+    """单独取一块数据；读不到时返回不可用标记而不是把整页带崩。"""
+
+    try:
+        return producer()
+    except Exception as error:  # 控制台是只读视图，任何一块后台数据失败都应降级
+        return unavailable(f"{label}读取失败: {error}")
 
 
 class ConsoleAPI:
@@ -21,10 +42,32 @@ class ConsoleAPI:
         self.platform = platform
 
     def status(self) -> dict:
-        payload = self.platform.status()
-        payload["topology"] = self.platform.topology_summary()
-        payload["namespaces"] = self.platform.namespaces.describe()
-        return payload
+        """逐块汇总状态快照；单块读不到只影响它自己，其余照常返回。"""
+
+        platform = self.platform
+        return {
+            "platform": safe_block("平台名", lambda: platform.config.name),
+            "project_id": safe_block("项目编号", lambda: platform.config.project_id),
+            "unit": safe_block("车间命名空间", lambda: platform.namespaces.unit),
+            "cycles": safe_block("周期计数", lambda: platform.cycles),
+            "now": safe_block("当前时钟", lambda: round(platform.clock.now(), 3)),
+            "utc": safe_block("UTC 时间", lambda: platform.clock.utc_iso()),
+            "molds": safe_block("模具台账", lambda: summarize_molds(platform.registry)),
+            "sensor_maps": safe_block("传感器映射", lambda: platform.maps.snapshot()),
+            "curves": safe_block("曲线代际", lambda: platform.curves.snapshot()),
+            "latch": safe_block("完成闩锁", lambda: platform.latch.snapshot()),
+            "fleet": safe_block("机群概览", lambda: summarize_fleet(platform.fleet)),
+            "scheduler": safe_block("调度器", lambda: platform.scheduler.snapshot()),
+            "presses": safe_block("硫化机快照", lambda: platform.fleet.snapshot()),
+            "trend": safe_block("趋势快照", lambda: platform.trend.snapshot()),
+            "namespaces_by_area": safe_block(
+                "命名空间分区", lambda: platform.namespaces_by_area()
+            ),
+            "audit": safe_block("审计摘要", lambda: platform.audit.summary()),
+            "endpoints": safe_block("接口清单", lambda: platform.endpoints()),
+            "topology": safe_block("链路拓扑", lambda: platform.topology_summary()),
+            "namespaces": safe_block("命名空间", lambda: platform.namespaces.describe()),
+        }
 
     def trend(self, series: str | None = None, window_s: float = 600.0) -> dict:
         """返回趋势窗口：采样点、均值与最新值。"""
@@ -39,50 +82,85 @@ class ConsoleAPI:
         start = end - window
         result: dict[str, dict] = {}
         for name in names:
-            filled = self.platform.trend.fill_gaps(name)
-            samples = self.platform.trend.window(name, start, end)
-            latest = self.platform.trend.latest(name)
-            result[name] = {
-                "filled_points": filled,
-                "samples": [sample.as_dict() for sample in samples],
-                "average": round(self.platform.trend.average(name, start, end), 4),
-                "latest": latest.as_dict() if latest else None,
-            }
+            result[name] = safe_block(  # type: ignore[assignment]
+                f"趋势分量 {name}", lambda name=name: self._trend_series(name, start, end)
+            )
         return {"window_s": window, "start": round(start, 3), "end": round(end, 3), "series": result}
 
+    def _trend_series(self, name: str, start: float, end: float) -> dict:
+        trend = self.platform.trend
+        filled = trend.fill_gaps(name)
+        samples = trend.window(name, start, end)
+        latest = trend.latest(name)
+        return {
+            "filled_points": filled,
+            "samples": [sample.as_dict() for sample in samples],
+            "average": round(trend.average(name, start, end), 4),
+            "latest": latest.as_dict() if latest else None,
+        }
+
     def alarms(self) -> dict:
-        alarms = self.platform.audit.alarms()
-        return {"count": len(alarms), "alarms": alarms}
+        def read_alarms() -> dict:
+            alarms = self.platform.audit.alarms()
+            return {"count": len(alarms), "alarms": alarms}
+
+        result = safe_block("告警", read_alarms)
+        if isinstance(result, dict) and "unavailable" not in result:
+            return result
+        # 保持成功时的外壳形状，前端按同一个字段名渲染失败标记
+        return {"count": None, "alarms": result}
 
     def audit(self, limit: int = 100) -> dict:
         bounded = max(1, min(MAX_AUDIT_LIMIT, int(limit)))
-        return {
-            "entries": self.platform.audit.entries(bounded),
-            "recent": self.platform.audit.tail(bounded // 4 + 1),
-        }
+
+        def read_audit() -> dict:
+            return {
+                "entries": self.platform.audit.entries(bounded),
+                "recent": self.platform.audit.tail(bounded // 4 + 1),
+            }
+
+        result = safe_block("审计记录", read_audit)
+        if isinstance(result, dict) and "unavailable" not in result:
+            return result
+        return {"entries": result, "recent": result}
 
     def journal(self, segment: int | None = None, limit: int = 200) -> dict:
         """读落盘日志；给段号时只读该段。"""
 
-        if segment is None:
-            return {"segment": None, "entries": self.platform.audit.replay_from_journal(limit)}
-        return {"segment": segment, "entries": self.platform.audit.replay_segment(segment)}
+        def read_journal() -> dict:
+            if segment is None:
+                return {"segment": None, "entries": self.platform.audit.replay_from_journal(limit)}
+            return {"segment": segment, "entries": self.platform.audit.replay_segment(segment)}
+
+        result = safe_block("落盘日志", read_journal)
+        if isinstance(result, dict) and "unavailable" not in result:
+            return result
+        return {"segment": segment, "entries": result}
 
     def readiness(self) -> dict:
         """投产前体检：把机群与模具的关键前置条件摊开给控制台。"""
 
         platform = self.platform
         return {
-            "idle_presses": [unit.press_id for unit in platform.fleet.idle_presses()],
-            "loaded_molds": {
-                unit.press_id: unit.mold_id for unit in platform.fleet.all() if unit.mold_id
-            },
-            "molds": summarize_count(platform),
-            "latched": platform.latch.set_molds(),
-            "queued": platform.scheduler.queue.entries(),
-            "curves": sorted(platform.curves.snapshot()),
-            "steam_target_kpa": platform.config.steam.target_pressure_kpa,
-            "temp_setpoint_c": platform.config.temp.setpoint_c,
+            "idle_presses": safe_block(
+                "空闲机群", lambda: [unit.press_id for unit in platform.fleet.idle_presses()]
+            ),
+            "loaded_molds": safe_block(
+                "在机模具",
+                lambda: {
+                    unit.press_id: unit.mold_id for unit in platform.fleet.all() if unit.mold_id
+                },
+            ),
+            "molds": safe_block("模具台账", lambda: summarize_count(platform)),
+            "latched": safe_block("完成闩锁", lambda: platform.latch.set_molds()),
+            "queued": safe_block("调度队列", lambda: platform.scheduler.queue.entries()),
+            "curves": safe_block("曲线代际", lambda: sorted(platform.curves.snapshot())),
+            "steam_target_kpa": safe_block(
+                "蒸汽目标压力", lambda: platform.config.steam.target_pressure_kpa
+            ),
+            "temp_setpoint_c": safe_block(
+                "模温设定", lambda: platform.config.temp.setpoint_c
+            ),
         }
 
     def cure(self, payload: dict) -> dict:
