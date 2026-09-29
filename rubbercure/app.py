@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .audit.log import AuditLog
@@ -443,28 +444,38 @@ class Platform:
         self.latch.release_all()
         return {"storage_root": self.store.root, "cleared": [item for item in removed if item]}
 
+    def status_sections(self) -> dict[str, Callable[[], object]]:
+        """把状态快照拆成按块读取的入口。
+
+        控制台据此逐块容错：某一块读不出来时只标那一块，其余照常返回。
+        """
+
+        return {
+            "platform": lambda: self.config.name,
+            "project_id": lambda: self.config.project_id,
+            "unit": lambda: self.namespaces.unit,
+            "cycles": lambda: self._cycles,
+            "now": lambda: round(self.clock.now(), 3),
+            "utc": self.clock.utc_iso,
+            "molds": lambda: summarize_molds(self.registry),
+            "sensor_maps": self.maps.snapshot,
+            "curves": self.curves.snapshot,
+            "latch": self.latch.snapshot,
+            "fleet": lambda: summarize_fleet(self.fleet),
+            "scheduler": self.scheduler.snapshot,
+            "presses": self.fleet.snapshot,
+            "trend": self.trend.snapshot,
+            "namespaces_by_area": self.namespaces_by_area,
+            "audit": self.audit.summary,
+            "endpoints": self.endpoints,
+            "topology": self.topology_summary,
+            "namespaces": self.namespaces.describe,
+        }
+
     def status(self) -> dict:
         """汇总状态快照，供控制台与命令行读取。"""
 
-        return {
-            "platform": self.config.name,
-            "project_id": self.config.project_id,
-            "unit": self.namespaces.unit,
-            "cycles": self._cycles,
-            "now": round(self.clock.now(), 3),
-            "utc": self.clock.utc_iso(),
-            "molds": summarize_molds(self.registry),
-            "sensor_maps": self.maps.snapshot(),
-            "curves": self.curves.snapshot(),
-            "latch": self.latch.snapshot(),
-            "fleet": summarize_fleet(self.fleet),
-            "scheduler": self.scheduler.snapshot(),
-            "presses": self.fleet.snapshot(),
-            "trend": self.trend.snapshot(),
-            "namespaces_by_area": self.namespaces_by_area(),
-            "audit": self.audit.summary(),
-            "endpoints": self.endpoints(),
-        }
+        return {name: read() for name, read in self.status_sections().items()}
 
     def namespaces_by_area(self) -> dict:
         """按工位分组返回命名空间，控制台据此渲染分区清单。"""

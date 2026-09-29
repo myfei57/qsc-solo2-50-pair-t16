@@ -9,6 +9,7 @@ import urllib.request
 from rubbercure.console.api import ConsoleAPI
 from rubbercure.console.pages import PAGE_TITLES, render_page
 from rubbercure.console.server import ConsoleServer, probe_pages
+from rubbercure.errors import StorageError
 
 
 def _request(url: str, method: str = "GET", payload: dict | None = None):
@@ -109,3 +110,103 @@ def test_render_page_rejects_unknown_page(platform):
         assert "nope" in str(error)
     else:  # pragma: no cover - 未抛错即失败
         raise AssertionError("未知页面必须报错")
+
+
+def test_status_marks_only_broken_sections(platform, monkeypatch):
+    def broken_topology():
+        raise StorageError("拓扑存储读不到", component="ns")
+
+    def broken_audit():
+        raise StorageError("审计汇总读不到", component="audit")
+
+    monkeypatch.setattr(platform, "topology_summary", broken_topology)
+    monkeypatch.setattr(platform.audit, "summary", broken_audit)
+
+    payload = ConsoleAPI(platform).status()
+    assert payload["platform"] == "RubberCure"
+    assert isinstance(payload["fleet"], dict)
+    assert payload["topology"]["available"] is False
+    assert payload["topology"]["error"] == "section_unavailable"
+    assert "拓扑存储读不到" in payload["topology"]["message"]
+    assert payload["audit"]["available"] is False
+    assert sorted(payload["unavailable_sections"]) == ["audit", "topology"]
+
+
+def test_platform_status_stays_strict(platform, monkeypatch):
+    """容错只放在控制台层：Platform.status 自身保持严格，便于调试期暴露问题。"""
+
+    def broken():
+        raise StorageError("读不到", component="ns")
+
+    monkeypatch.setattr(platform, "topology_summary", broken)
+    try:
+        platform.status()
+    except StorageError:
+        pass
+    else:  # pragma: no cover - 未抛错即失败
+        raise AssertionError("Platform.status 必须保持严格")
+
+
+def test_trend_marks_only_broken_series(platform, monkeypatch):
+    now = platform.clock.now()
+    platform.trend.append("press-01.mold_c", now, 160.0)
+    platform.trend.append("press-01.steam_kpa", now, 420.0)
+    real_window = platform.trend.window
+
+    def flaky_window(name, start, end):
+        if name == "press-01.steam_kpa":
+            raise StorageError("蒸汽趋势缓冲读不到", component="telemetry")
+        return real_window(name, start, end)
+
+    monkeypatch.setattr(platform.trend, "window", flaky_window)
+
+    payload = ConsoleAPI(platform).trend(window_s=60.0)
+    assert payload["series"]["press-01.mold_c"]["samples"]
+    steam = payload["series"]["press-01.steam_kpa"]
+    assert steam["available"] is False
+    assert steam["error"] == "section_unavailable"
+    assert "蒸汽趋势缓冲读不到" in steam["message"]
+    assert payload["unavailable_sections"] == ["press-01.steam_kpa"]
+
+
+def test_http_status_survives_broken_section(platform, monkeypatch):
+    def broken_topology():
+        raise StorageError("拓扑存储读不到", component="ns")
+
+    monkeypatch.setattr(platform, "topology_summary", broken_topology)
+    server = ConsoleServer(platform)
+    base_url = server.start()
+    try:
+        status, payload = _request(f"{base_url}/api/status")
+        assert status == 200
+        assert payload["topology"]["available"] is False
+        assert payload["topology"]["error"] == "section_unavailable"
+        assert isinstance(payload["fleet"], dict)
+        assert payload["unavailable_sections"] == ["topology"]
+    finally:
+        server.stop()
+
+
+def test_http_alarms_marks_unavailable(platform, monkeypatch):
+    def broken_alarms():
+        raise StorageError("告警台账读不到", component="audit")
+
+    monkeypatch.setattr(platform.audit, "alarms", broken_alarms)
+    server = ConsoleServer(platform)
+    base_url = server.start()
+    try:
+        status, payload = _request(f"{base_url}/api/alarms")
+        assert status == 200
+        assert payload["available"] is False
+        assert payload["error"] == "section_unavailable"
+        assert "告警台账读不到" in payload["message"]
+    finally:
+        server.stop()
+
+
+def test_page_script_isolates_panels(platform):
+    page = render_page("press", platform)
+    assert "Promise.allSettled" in page
+    assert "loadPanel" in page
+    assert "暂时不可用" in page
+    assert "unavailable_sections" in page

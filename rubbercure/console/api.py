@@ -3,15 +3,46 @@
 接口只做参数校验收敛与转发，业务判断全部留在组件与顺序执行器里：状态来自
 ``Platform`` 的状态快照，趋势走趋势缓冲，硫化／开模／调度／停运走四条工艺
 顺序。控制台因此不会绕开联锁，也不会自己拼一条工艺链。
+
+只读聚合接口遵循逐块容错：每块后台数据单独读取，某一块读不出来（比如落盘
+状态损坏、子系统抛错）时只把那一块标成 ``section_unavailable``，其余块照常
+返回，不让一个依赖把整个控制台带崩。
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 from ..app import CycleInputs, Platform
 from ..errors import RubberCureError
 
 MAX_TREND_WINDOW_S = 86_400.0
 MAX_AUDIT_LIMIT = 500
+
+
+def section_unavailable(name: str, error: Exception) -> dict:
+    """一块后台数据读不出来时的统一占位标记。"""
+
+    return {
+        "available": False,
+        "error": "section_unavailable",
+        "section": name,
+        "message": str(error) or type(error).__name__,
+    }
+
+
+def read_sections(sections: dict[str, Callable[[], object]]) -> tuple[dict, list[str]]:
+    """逐块读取并兜底：单块失败只标记那一块。"""
+
+    result: dict[str, object] = {}
+    unavailable: list[str] = []
+    for name, read in sections.items():
+        try:
+            result[name] = read()
+        except Exception as error:  # noqa: BLE001 - 控制台只读视图必须容错，不放大单个依赖故障
+            result[name] = section_unavailable(name, error)
+            unavailable.append(name)
+    return result, unavailable
 
 
 class ConsoleAPI:
@@ -21,9 +52,8 @@ class ConsoleAPI:
         self.platform = platform
 
     def status(self) -> dict:
-        payload = self.platform.status()
-        payload["topology"] = self.platform.topology_summary()
-        payload["namespaces"] = self.platform.namespaces.describe()
+        payload, unavailable = read_sections(self.platform.status_sections())
+        payload["unavailable_sections"] = unavailable
         return payload
 
     def trend(self, series: str | None = None, window_s: float = 600.0) -> dict:
@@ -37,53 +67,78 @@ class ConsoleAPI:
             raise ValueError(f"未知的趋势分量: {', '.join(unknown)}")
         end = self.platform.clock.now()
         start = end - window
-        result: dict[str, dict] = {}
-        for name in names:
-            filled = self.platform.trend.fill_gaps(name)
-            samples = self.platform.trend.window(name, start, end)
-            latest = self.platform.trend.latest(name)
-            result[name] = {
+
+        def read_one(name: str) -> dict:
+            buffer = self.platform.trend
+            filled = buffer.fill_gaps(name)
+            samples = buffer.window(name, start, end)
+            latest = buffer.latest(name)
+            return {
                 "filled_points": filled,
                 "samples": [sample.as_dict() for sample in samples],
-                "average": round(self.platform.trend.average(name, start, end), 4),
+                "average": round(buffer.average(name, start, end), 4),
                 "latest": latest.as_dict() if latest else None,
             }
-        return {"window_s": window, "start": round(start, 3), "end": round(end, 3), "series": result}
+
+        result, unavailable = read_sections({name: (lambda n=name: read_one(n)) for name in names})
+        return {
+            "window_s": window,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "series": result,
+            "unavailable_sections": unavailable,
+        }
 
     def alarms(self) -> dict:
-        alarms = self.platform.audit.alarms()
-        return {"count": len(alarms), "alarms": alarms}
+        def read_alarms() -> dict:
+            alarms = self.platform.audit.alarms()
+            return {"count": len(alarms), "alarms": alarms}
+
+        result, _ = read_sections({"alarms": read_alarms})
+        return result["alarms"]
 
     def audit(self, limit: int = 100) -> dict:
         bounded = max(1, min(MAX_AUDIT_LIMIT, int(limit)))
-        return {
-            "entries": self.platform.audit.entries(bounded),
-            "recent": self.platform.audit.tail(bounded // 4 + 1),
-        }
+
+        def read_audit() -> dict:
+            return {
+                "entries": self.platform.audit.entries(bounded),
+                "recent": self.platform.audit.tail(bounded // 4 + 1),
+            }
+
+        result, _ = read_sections({"audit": read_audit})
+        return result["audit"]
 
     def journal(self, segment: int | None = None, limit: int = 200) -> dict:
         """读落盘日志；给段号时只读该段。"""
 
-        if segment is None:
-            return {"segment": None, "entries": self.platform.audit.replay_from_journal(limit)}
-        return {"segment": segment, "entries": self.platform.audit.replay_segment(segment)}
+        def read_journal() -> dict:
+            if segment is None:
+                return {"segment": None, "entries": self.platform.audit.replay_from_journal(limit)}
+            return {"segment": segment, "entries": self.platform.audit.replay_segment(segment)}
+
+        result, _ = read_sections({"journal": read_journal})
+        return result["journal"]
 
     def readiness(self) -> dict:
         """投产前体检：把机群与模具的关键前置条件摊开给控制台。"""
 
         platform = self.platform
-        return {
-            "idle_presses": [unit.press_id for unit in platform.fleet.idle_presses()],
-            "loaded_molds": {
+        sections: dict[str, Callable[[], object]] = {
+            "idle_presses": lambda: [unit.press_id for unit in platform.fleet.idle_presses()],
+            "loaded_molds": lambda: {
                 unit.press_id: unit.mold_id for unit in platform.fleet.all() if unit.mold_id
             },
-            "molds": summarize_count(platform),
-            "latched": platform.latch.set_molds(),
-            "queued": platform.scheduler.queue.entries(),
-            "curves": sorted(platform.curves.snapshot()),
-            "steam_target_kpa": platform.config.steam.target_pressure_kpa,
-            "temp_setpoint_c": platform.config.temp.setpoint_c,
+            "molds": lambda: summarize_count(platform),
+            "latched": platform.latch.set_molds,
+            "queued": platform.scheduler.queue.entries,
+            "curves": lambda: sorted(platform.curves.snapshot()),
+            "steam_target_kpa": lambda: platform.config.steam.target_pressure_kpa,
+            "temp_setpoint_c": lambda: platform.config.temp.setpoint_c,
         }
+        payload, unavailable = read_sections(sections)
+        payload["unavailable_sections"] = unavailable
+        return payload
 
     def cure(self, payload: dict) -> dict:
         """在一台硫化机上跑硫化顺序。"""

@@ -3,7 +3,8 @@
 四个页面分别对应硫化机、蒸汽升温、硫化计时与告警。页面本身只做展示：数据
 全部通过 ``/api/status``、``/api/trend``、``/api/alarms`` 拉取，页面里的
 按钮走 ``/api/cure``、``/api/open``、``/api/dispatch``、``/api/step``，
-不内嵌任何业务逻辑。
+不内嵌任何业务逻辑。每块面板独立拉取、独立兜底：某一块后台数据读不出来时
+只把那块标成暂时不可用，其余面板照常刷新。
 """
 
 from __future__ import annotations
@@ -35,20 +36,76 @@ pre { font-size: 12px; background: #0f0d0a; padding: 10px; border-radius: 6px; o
 """
 
 _SCRIPT = """
-async function refresh() {
-  const status = await (await fetch('/api/status')).json();
-  const alarms = await (await fetch('/api/alarms')).json();
-  const trend = await (await fetch('/api/trend?window_s=600')).json();
-  document.getElementById('out-status').textContent = JSON.stringify(status, null, 2);
-  document.getElementById('out-alarms').textContent =
-    alarms.count + ' 条告警\\n' + JSON.stringify(alarms.alarms.slice(-8), null, 2);
-  document.getElementById('out-trend').textContent = JSON.stringify(trend.series, null, 2);
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body === null) {
+    throw new Error(url + ' 返回 ' + response.status);
+  }
+  return body;
+}
+function showUnavailable(id, error) {
+  const el = document.getElementById(id);
+  el.style.color = '#e0a34a';
+  el.textContent = '⚠ 暂时不可用（' + (error && error.message ? error.message : error) +
+    '），其余面板不受影响';
+}
+function renderStatus(status) {
+  const el = document.getElementById('out-status');
+  el.style.color = '';
+  let text = JSON.stringify(status, null, 2);
+  const missing = status.unavailable_sections || [];
+  if (missing.length) {
+    el.style.color = '#e0a34a';
+    text = '⚠ 以下数据块暂时不可用: ' + missing.join(', ') + '\\n\\n' + text;
+  }
+  el.textContent = text;
+}
+function renderAlarms(alarms) {
+  const el = document.getElementById('out-alarms');
+  el.style.color = '';
+  if (alarms && alarms.available === false) {
+    showUnavailable('out-alarms', alarms.message);
+    return;
+  }
+  el.textContent = alarms.count + ' 条告警\\n' + JSON.stringify(alarms.alarms.slice(-8), null, 2);
+}
+function renderTrend(trend) {
+  const el = document.getElementById('out-trend');
+  el.style.color = '';
+  if (trend && trend.available === false) {
+    showUnavailable('out-trend', trend.message);
+    return;
+  }
+  el.textContent = JSON.stringify(trend.series, null, 2);
+}
+async function loadPanel(url, id, render) {
+  try {
+    render(await fetchJson(url));
+  } catch (error) {
+    showUnavailable(id, error);
+  }
+}
+function refresh() {
+  Promise.allSettled([
+    loadPanel('/api/status', 'out-status', renderStatus),
+    loadPanel('/api/alarms', 'out-alarms', renderAlarms),
+    loadPanel('/api/trend?window_s=600', 'out-trend', renderTrend),
+  ]);
 }
 async function act(path, payload) {
   const init = {method: 'POST', headers: {'Content-Type': 'application/json'}};
   if (payload) { init.body = JSON.stringify(payload); }
-  const result = await (await fetch(path, init)).json();
-  document.getElementById('out-action').textContent = JSON.stringify(result, null, 2);
+  const out = document.getElementById('out-action');
+  try {
+    const response = await fetch(path, init);
+    const result = await response.json().catch(() => null);
+    out.textContent = result === null
+      ? '⚠ 操作失败：服务返回 ' + response.status
+      : JSON.stringify(result, null, 2);
+  } catch (error) {
+    out.textContent = '⚠ 操作失败：' + (error && error.message ? error.message : error);
+  }
   refresh();
 }
 window.addEventListener('DOMContentLoaded', () => {

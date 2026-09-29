@@ -92,6 +92,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not-found", "path": parsed.path}, status=404)
         except (ValueError, KeyError) as error:
             self._send_json({"error": str(error)}, status=400)
+        except Exception as error:  # noqa: BLE001 - 兜底：任何漏网异常都回 JSON，不让前端拿到半截连接
+            self._send_json(
+                {"error": "internal", "message": str(error) or type(error).__name__},
+                status=503,
+            )
 
     def do_POST(self) -> None:  # noqa: N802 - http.server 回调命名
         parsed = urlparse(self.path)

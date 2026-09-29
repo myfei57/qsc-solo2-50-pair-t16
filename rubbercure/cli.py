@@ -115,10 +115,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     platform = _build(args)
-    payload = platform.status()
-    payload["topology"] = platform.topology_summary()
-    payload["namespaces"] = platform.namespaces.describe()
-    _dump(payload)
+    _dump(platform.status())
     return 0
 
 
